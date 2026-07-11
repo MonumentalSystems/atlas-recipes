@@ -12,14 +12,26 @@ metadata:
     validated 2026-07-11 on gx10 against a tip Atlas build in the CUDA-13.2
     CUTLASS/FlashInfer container atlas-gb10:b12x-ready.
 
-    HEADLINE — WARM single-request prefill throughput (measured 2026-07-11):
-        4K  4975 tok/s
-        8K  5489 tok/s
-       16K  5208 tok/s
-    This is ~10x the ~500-600 tok/s a partial config delivers. The gap is
+    HEADLINE — WARM single-request prefill throughput (measured 2026-07-11,
+    correct long-context config ATLAS_GDN_FLASHINFER=0):
+        4K  3518 tok/s
+        8K  3759 tok/s
+       16K  3569 tok/s
+    This is ~6-7x the ~500-600 tok/s a partial config delivers. The gap is
     ENTIRELY the prefill-accelerator flag cluster below (fused-MoE grouped
-    CUTLASS GEMM + FlashInfer GDN prefill + batched SSM recurrent + varlen/
+    CUTLASS GEMM + FLA in-tree GDN prefill + batched SSM recurrent + varlen/
     co-dispatch prefill). Dropping ANY single flag silently HALVES prefill.
+
+    Short-context-only fast variant: ATLAS_GDN_FLASHINFER=1 measured
+    4K 4975 / 8K 5489 / 16K 5208 tok/s (~7-30% faster) — but it CORRUPTS at
+    >=128K (see the long-context correctness note below). Use =1 ONLY for
+    short-context serving; the 256K default here is =0.
+
+    Long-context correctness: ATLAS_GDN_FLASHINFER=0 (FLA in-tree GDN) is
+    REQUIRED at >=128K — FlashInfer GDN (=1) corrupts (7/8 needle FAIL at
+    200K per MonumentalSystems/atlas PR #22 LONGCTX-NEEDLE-BENCHMARK; F32
+    output/inverse do not fix it). =1 is ~7-30% faster prefill but only safe
+    for short context. This is a 256K recipe, so correctness wins: =0.
 
     HEADLINE #2 — 256K long-context serving. Two levers make 256K both fast
     AND coherent:
@@ -79,7 +91,8 @@ metadata:
       # --- GDN/SSM + GEMM (GDN is 30 of 40 layers; SSM_BATCHED_RECURRENT
       #     and FLASHINFER_PREFILL are the two biggest single wins) ---
       ATLAS_GDN_TC_VBLOCK=0
-      ATLAS_GDN_FLASHINFER=1
+      ATLAS_GDN_FLASHINFER=0   # REQUIRED at >=128K (see correctness note);
+                               # =1 is faster but corrupts long context
       ATLAS_FLASHINFER_PREFILL=1
       ATLAS_CUBLAS_GEMM=1
       ATLAS_CUTLASS_WORKSPACE_MB=512
@@ -111,7 +124,7 @@ metadata:
       -e ATLAS_MOE_PREFILL_EXACT_TILES=1 \
       -e ATLAS_HOLO_NATIVE_FP8_ATTN=1 -e ATLAS_HOLO_NATIVE_FP8_SSM=1 \
       -e ATLAS_HOLO_FP4_PROJ_DECODE=1 \
-      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=1 \
+      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=0 \
       -e ATLAS_FLASHINFER_PREFILL=1 -e ATLAS_CUBLAS_GEMM=1 \
       -e ATLAS_CUTLASS_WORKSPACE_MB=512 -e ATLAS_KV_OVERCOMMIT=1 \
       -e ATLAS_SSM_BATCHED_RECURRENT=1 \

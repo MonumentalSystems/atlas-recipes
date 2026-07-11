@@ -23,6 +23,12 @@ metadata:
     coherent at depth (fp8/nvfp4 KV degrade long-context). ATLAS_KV_OVERCOMMIT=1
     is REQUIRED at 256K (on-demand paged KV allocation).
 
+    Long-context correctness: ATLAS_GDN_FLASHINFER=0 (FLA in-tree GDN) is
+    REQUIRED at >=128K — FlashInfer GDN (=1) corrupts (7/8 needle FAIL at
+    200K per MonumentalSystems/atlas PR #22 LONGCTX-NEEDLE-BENCHMARK; F32
+    output/inverse do not fix it). =1 is ~7-30% faster prefill but only safe
+    for short context. This is a 256K recipe, so correctness wins: =0.
+
     ======================================================================
     BUILD — CRITICAL: build INSIDE atlas-gb10:b12x-ready, NOT bare host
     ======================================================================
@@ -54,7 +60,8 @@ metadata:
       # --- GDN/SSM + GEMM (SSM_BATCHED_RECURRENT and FLASHINFER_PREFILL
       #     are the two biggest single wins) ---
       ATLAS_GDN_TC_VBLOCK=0
-      ATLAS_GDN_FLASHINFER=1
+      ATLAS_GDN_FLASHINFER=0   # REQUIRED at >=128K (see correctness note);
+                               # =1 is faster but corrupts long context
       ATLAS_FLASHINFER_PREFILL=1
       ATLAS_CUBLAS_GEMM=1
       ATLAS_CUTLASS_WORKSPACE_MB=512
@@ -80,7 +87,7 @@ metadata:
       -v <repo>:/atlas -v /tank:/tank:ro \
       -e HF_HUB_CACHE=/tank/hf/hub \
       -e ATLAS_TARGET_HW=gb10 -e HF_HUB_OFFLINE=1 -e RUST_LOG=info \
-      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=1 \
+      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=0 \
       -e ATLAS_FLASHINFER_PREFILL=1 -e ATLAS_CUBLAS_GEMM=1 \
       -e ATLAS_CUTLASS_WORKSPACE_MB=512 -e ATLAS_KV_OVERCOMMIT=1 \
       -e ATLAS_SSM_BATCHED_RECURRENT=1 \
