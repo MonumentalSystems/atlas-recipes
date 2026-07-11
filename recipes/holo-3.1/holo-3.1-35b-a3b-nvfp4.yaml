@@ -7,60 +7,135 @@ max_nodes: 1
 metadata:
   description: |
     Holo-3.1-35B-A3B (qwen3_5_moe architecture, H Company NVFP4 checkpoint)
-    — the PRIMARY Holo-3.1 recipe, tuned for best throughput/latency at a
-    256K context window on a single GB10 (sm_121). Live-validated
-    2026-07-11 on gx10 against a tip Atlas build in atlas-gb10:b12x-ready.
+    — the PRIMARY Holo-3.1 recipe, tuned for record single-request PREFILL
+    throughput at a 256K context window on a single GB10 (sm_121). Live-
+    validated 2026-07-11 on gx10 against a tip Atlas build in the CUDA-13.2
+    CUTLASS/FlashInfer container atlas-gb10:b12x-ready.
 
-    HEADLINE: 256K long-context serving. The two levers that make 256K both
-    fast AND coherent:
-      - bf16 KV cache (kv_cache_dtype: bf16). Measured 1.4-2x faster prefill
-        than fp8 KV, and it stays coherent deep into the context where
-        fp8/nvfp4 KV degrade. Do NOT use fp8/nvfp4 KV for the long-context
-        recipe — the memory saving is not worth the quality cliff at depth.
+    HEADLINE — WARM single-request prefill throughput (measured 2026-07-11):
+        4K  4975 tok/s
+        8K  5489 tok/s
+       16K  5208 tok/s
+    This is ~10x the ~500-600 tok/s a partial config delivers. The gap is
+    ENTIRELY the prefill-accelerator flag cluster below (fused-MoE grouped
+    CUTLASS GEMM + FlashInfer GDN prefill + batched SSM recurrent + varlen/
+    co-dispatch prefill). Dropping ANY single flag silently HALVES prefill.
+
+    HEADLINE #2 — 256K long-context serving. Two levers make 256K both fast
+    AND coherent:
+      - bf16 KV cache (kv_cache_dtype: bf16). ~1.4-2x faster prefill than
+        fp8 KV, and it stays coherent deep into the context where fp8/nvfp4
+        KV degrade. Do NOT use fp8/nvfp4 KV for the long-context recipe —
+        the memory saving is not worth the quality cliff at depth.
       - ATLAS_KV_OVERCOMMIT=1 (env, REQUIRED at 256K). A 256K sequence needs
         ~16000 KV blocks; without overcommit the server refuses to start
-        unless the KV pool can hold max_batch_size x 256K reserved.
-        Overcommit switches to on-demand paged allocation, so max_batch_size
-        8 boots while any single sequence can still grow to the full 256K.
-
-    KV pool sizing (gpu_memory_utilization lever, GB10 121 GB):
-      - 0.72 (this default) with ~27 GB of co-tenants leaves a ~19 GB KV
-        pool -> 62277 blocks -> ~996K total KV tokens (~3.9 concurrent 256K
-        sequences resident; overcommit pages in the rest on demand).
-      - On a DEDICATED box push to 0.80-0.85 for more concurrent
-        long-context sequences.
+        unless the KV pool can hold max_num_seqs x 256K reserved. Overcommit
+        switches to on-demand paged allocation, so max_num_seqs 16 boots
+        while any single sequence can still grow to the full 256K window.
 
     lm-head: leave default. The NVFP4 checkpoint ships lm_head pre-packed
-    NVFP4; passing --lm-head-dtype bf16 is IGNORED for this checkpoint (do
-    not set lm_head_dtype here).
+    NVFP4; do NOT pass --lm-head-dtype (it is IGNORED for this checkpoint,
+    and passing bf16 can wrongly imply an unpacked head).
 
-    ---- BUILD (serve-anything artifact) ----
-    Kernel target for this model: holo-3.1-35b-a3b. Build ALL targets so one
-    binary serves any Holo-3.1 combo (a single-target build carries only that
-    model's kernels and errors with "missing more kernels than expected"):
-      ATLAS_TARGET_HW=gb10 \
-      ATLAS_TARGET_QUANT=nvfp4 \
-      ATLAS_TARGET_MODEL='*' \
-      cargo build --release --no-default-features --features cuda
-    Single-GB10: DROP the nccl feature (it is default-on but multi-GPU EP/TP
-    only, and libnccl is not in the single-node link path) — hence
-    --no-default-features --features cuda. Binary: target/release/spark.
-    Container base atlas-gb10:b12x-ready (CUDA 13.2); the host-built spark
-    runs in it via a bind-mount of the repo at /atlas.
+    ======================================================================
+    BUILD — CRITICAL: build INSIDE atlas-gb10:b12x-ready, NOT bare host
+    ======================================================================
+    The spark binary MUST be compiled inside the CUDA-13.2 CUTLASS/
+    FlashInfer container atlas-gb10:b12x-ready. That image sets
+    CUTLASS_HOME=/opt/cutlass, FLASHINFER_HOME=/opt/flashinfer, and
+    CUTE_DSL_ARCH=sm_121a. spark-runtime/build.rs GATES the fused-MoE
+    kernel (cutlass_nvfp4_grouped_gemm.cu) and the atlas_cutlass cfg on
+    CUTLASS_HOME being set — a bare-host `cargo build` SILENTLY omits the
+    fused-MoE kernel and prefill collapses to ~500 tok/s with no error.
 
-    ---- RUN (canonical on this box) ----
-    docker run -d --name holo31-35b --gpus all \
+    Build command (kernel target for this model: holo-3.1-35b-a3b):
+      docker run --rm -v <repo>:/atlas -w /atlas atlas-gb10:b12x-ready \
+        bash -c 'ATLAS_TARGET_HW=gb10 \
+          ATLAS_TARGET_MODEL=holo-3.1-35b-a3b \
+          ATLAS_TARGET_QUANT=nvfp4 \
+          cargo build --release -p spark-server \
+            --no-default-features --features cuda'
+    --no-default-features --features cuda drops the (default-on) nccl
+    feature: it is multi-GPU EP/TP only and libnccl is not in the single-
+    node link path. Binary: target/release/spark.
+
+    ======================================================================
+    FULL PROVEN ENV — every var required; dropping any silently HALVES
+    prefill. Set every -e on the container (RUN block below).
+    ======================================================================
+      ATLAS_TARGET_HW=gb10   HF_HUB_OFFLINE=1   RUST_LOG=info
+
+      # --- Holo MoE (35B-A3B is qwen3_5_moe; MoE path only) ---
+      ATLAS_HOLO_LOW_MEMORY_MOE=1
+      ATLAS_HOLO_FAST_MOE_MODE=full
+      ATLAS_HOLO_FAST_MOE_LAYERS=0-39
+      ATLAS_HOLO_MOE_GROUPED_CUTLASS=1
+      ATLAS_HOLO_MOE_GROUPED_DOWN=1
+      ATLAS_MOE_PREFILL_EXACT_TILES=1
+      ATLAS_HOLO_NATIVE_FP8_ATTN=1
+      ATLAS_HOLO_NATIVE_FP8_SSM=1
+      ATLAS_HOLO_FP4_PROJ_DECODE=1
+
+      # --- GDN/SSM + GEMM (GDN is 30 of 40 layers; SSM_BATCHED_RECURRENT
+      #     and FLASHINFER_PREFILL are the two biggest single wins) ---
+      ATLAS_GDN_TC_VBLOCK=0
+      ATLAS_GDN_FLASHINFER=1
+      ATLAS_FLASHINFER_PREFILL=1
+      ATLAS_CUBLAS_GEMM=1
+      ATLAS_CUTLASS_WORKSPACE_MB=512
+      ATLAS_KV_OVERCOMMIT=1
+      ATLAS_SSM_BATCHED_RECURRENT=1
+      ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so
+      CUTE_DSL_ARCH=sm_121a
+
+      # --- Prefill accelerators (model-agnostic) ---
+      ATLAS_PREFILL_VARLEN=1
+      ATLAS_PREFILL_CODISPATCH=1
+      ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100
+      ATLAS_Q12_BATCHED=1
+      ATLAS_Q12_BATCHED_FIRST_CHUNK=1
+      ATLAS_MAX_BATCH_TOKENS=16384
+      ATLAS_DECODE_GRAPHS_MULTISEQ=1
+      ATLAS_FP8_SINGLE_SCALE=1
+
+    ======================================================================
+    RUN — canonical on this box
+    ======================================================================
+    docker run -d --name holo35b --gpus all --ipc=host \
       -v <repo>:/atlas -v /tank:/tank:ro \
-      -e HF_HUB_CACHE=/tank/hf/hub -e ATLAS_KV_OVERCOMMIT=1 \
+      -e HF_HUB_CACHE=/tank/hf/hub \
+      -e ATLAS_TARGET_HW=gb10 -e HF_HUB_OFFLINE=1 -e RUST_LOG=info \
+      -e ATLAS_HOLO_LOW_MEMORY_MOE=1 -e ATLAS_HOLO_FAST_MOE_MODE=full \
+      -e ATLAS_HOLO_FAST_MOE_LAYERS=0-39 \
+      -e ATLAS_HOLO_MOE_GROUPED_CUTLASS=1 -e ATLAS_HOLO_MOE_GROUPED_DOWN=1 \
+      -e ATLAS_MOE_PREFILL_EXACT_TILES=1 \
+      -e ATLAS_HOLO_NATIVE_FP8_ATTN=1 -e ATLAS_HOLO_NATIVE_FP8_SSM=1 \
+      -e ATLAS_HOLO_FP4_PROJ_DECODE=1 \
+      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=1 \
+      -e ATLAS_FLASHINFER_PREFILL=1 -e ATLAS_CUBLAS_GEMM=1 \
+      -e ATLAS_CUTLASS_WORKSPACE_MB=512 -e ATLAS_KV_OVERCOMMIT=1 \
+      -e ATLAS_SSM_BATCHED_RECURRENT=1 \
+      -e ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so \
+      -e CUTE_DSL_ARCH=sm_121a \
+      -e ATLAS_PREFILL_VARLEN=1 -e ATLAS_PREFILL_CODISPATCH=1 \
+      -e ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100 \
+      -e ATLAS_Q12_BATCHED=1 -e ATLAS_Q12_BATCHED_FIRST_CHUNK=1 \
+      -e ATLAS_MAX_BATCH_TOKENS=16384 -e ATLAS_DECODE_GRAPHS_MULTISEQ=1 \
+      -e ATLAS_FP8_SINGLE_SCALE=1 \
       -p 8888:8888 atlas-gb10:b12x-ready \
       /atlas/target/release/spark serve "Hcompany/Holo-3.1-35B-A3B-NVFP4" \
-        --max-seq-len 256000 --kv-cache-dtype bf16 \
-        --gpu-memory-utilization 0.72 \
-        --scheduling-policy slai --tbt-deadline-ms 100 \
-        --ssm-cache-slots 256 --bind 0.0.0.0 --port 8888
+        --port 8888 --bind 0.0.0.0 \
+        --kv-cache-dtype bf16 --gpu-memory-utilization 0.7 \
+        --max-seq-len 262144 --max-num-seqs 16 --max-batch-size 16 \
+        --max-prefill-tokens 16384 --scheduling-policy slai \
+        --enable-prefix-caching true \
+        --ssm-cache-slots 128 --ssm-checkpoint-interval 16
 
-    Model ceiling is 262144 (max_position_embeddings); 256000 is the
-    validated 256K window and leaves headroom.
+    The 256K window comes from --max-seq-len 262144 (model ceiling =
+    max_position_embeddings) paired with ATLAS_KV_OVERCOMMIT=1 paged KV.
+    NOTE: --target-kv-tokens and --vision-max-pixels exist on NEWER
+    binaries only — OMIT them if the binary rejects them. Do NOT pass
+    --lm-head-dtype (NVFP4 checkpoint ships a packed NVFP4 head).
   maintainer: monumental
   category: agent
   model_params: 35B
@@ -71,20 +146,24 @@ metadata:
 defaults:
   port: 8888
   host: 0.0.0.0
-  # 256K window (validated). Model ceiling is 262144; 256000 is the
-  # live-validated long-context window.
-  max_model_len: 256000
-  # bf16 KV: 1.4-2x faster prefill than fp8 AND coherent at 256K depth.
+  # 256K window via model ceiling (max_position_embeddings = 262144)
+  # + ATLAS_KV_OVERCOMMIT=1 paged KV.
+  max_model_len: 262144
+  # bf16 KV: ~1.4-2x faster prefill than fp8 AND coherent at 256K depth.
   # Never fp8/nvfp4 KV for the long-context recipe.
   kv_cache_dtype: bf16
-  # 0.72 = safe with ~27 GB co-tenants (~19 GB KV pool, ~996K KV tokens).
-  # Raise to 0.80-0.85 on a dedicated box for more concurrent 256K seqs.
-  gpu_memory_utilization: 0.72
+  # 0.7 co-tenant-safe default; raise on a dedicated box for more
+  # concurrent 256K sequences.
+  gpu_memory_utilization: 0.7
+  max_num_seqs: 16
+  max_batch_size: 16
+  max_prefill_tokens: 16384
   scheduling_policy: slai
-  # Marconi SSM snapshot slots (qwen3_5_moe is hybrid SSM+Attn). 256 holds
-  # a full multi-turn session without warm-checkpoint LRU churn.
-  ssm_cache_slots: 256
+  # Marconi SSM snapshot slots (qwen3_5_moe is hybrid SSM+Attn).
+  ssm_cache_slots: 128
+  ssm_checkpoint_interval: 16
   enable_prefix_caching: true
-# ENV (required at 256K, no declarative slot in recipe_version 2 — set on the
-# container, see RUN block above): ATLAS_KV_OVERCOMMIT=1, HF_HUB_CACHE=/tank/hf/hub.
-# TBT target: --tbt-deadline-ms 100 pairs with scheduling_policy: slai.
+# ENV: the FULL ATLAS_* prefill stack is MANDATORY (no declarative slot in
+# recipe_version 2) — set every -e on the container, see the BUILD/RUN
+# blocks above. Dropping any one silently halves prefill (~5K -> ~500 tok/s).
+# Build INSIDE atlas-gb10:b12x-ready or build.rs omits the fused-MoE kernel.
