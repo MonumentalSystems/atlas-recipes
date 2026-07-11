@@ -29,6 +29,8 @@ sparkrun registry add https://github.com/Avarok-Cybersecurity/atlas-recipes.git
 | `qwen3.6-35b-a3b-fp8-bf16head` | Qwen/Qwen3.6-35B-A3B-FP8 | single | 32K safe profile of the FP8 flagship (same bf16 head/KV) |
 | `qwen3.6-35b-a3b-fp8-nvfp4head` | Qwen/Qwen3.6-35B-A3B-FP8 | single | nvfp4 lm-head sibling — near-neutral wall, lower VRAM |
 | `qwen3.6-27b-fp8-mtp` | Qwen/Qwen3.6-27B-FP8 | single | Dense hybrid SSM+Attn, MTP K=2, ~15 tok/s |
+| `holo-3.1-35b-a3b-nvfp4` | Hcompany/Holo-3.1-35B-A3B-NVFP4 | single | **256K long-context** — qwen3_5_moe, kernel `holo-3.1-35b-a3b`, bf16 KV + `ATLAS_KV_OVERCOMMIT=1`, SLAI @100ms TBT, ssm-cache-slots 256 (validated gx10 2026-07-11) |
+| `holo-3.1-9b-bf16` | Hcompany/Holo-3.1-9B | single | **256K long-context** — dense qwen3_5 served by kernel `ornith-1.0-9b` (no holo-3.1-9b kernel dir), bf16 weights + bf16 KV, no SSM slots |
 | `qwen3.5-35b-a3b-nvfp4` | Sehyo/Qwen3.5-35B-A3B-NVFP4 | single | MTP K=2, ~131 tok/s |
 | `qwen3.5-27b-dense-nvfp4` | Kbenkhaled/Qwen3.5-27B-NVFP4 | single | Dense hybrid SSM+Attn, ~14 tok/s |
 | `qwen3.5-122b-a10b-nvfp4-single` | Sehyo/Qwen3.5-122B-A10B-NVFP4 | single | Tight KV/seq budget, all 256 experts on one node |
@@ -52,6 +54,9 @@ recipes/
 │   ├── qwen3.5-35b-a3b-nvfp4.yaml
 │   ├── qwen3.5-122b-a10b-nvfp4-single.yaml
 │   └── qwen3.5-122b-a10b-nvfp4-ep2.yaml
+├── holo-3.1/
+│   ├── holo-3.1-35b-a3b-nvfp4.yaml
+│   └── holo-3.1-9b-bf16.yaml
 ├── qwen3-next/qwen3-next-80b-a3b-nvfp4.yaml
 ├── qwen3-vl/qwen3-vl-30b-a3b-nvfp4.yaml
 ├── qwen3-coder-next/qwen3-coder-next-fp8.yaml
@@ -71,6 +76,7 @@ Each recipe carries the production-validated KV/seq/MoE settings drawn from Atla
 - **Mistral Small 4** enforces `kv_cache_dtype: bf16` — FP8/NVFP4 KV destroys the MLA compressed latent (Atlas alpha-2.8 release announcement).
 - **Qwen3-Coder-Next-FP8** requires `ssm_cache_slots: 0`, `oom_guard_mb: 1024`, and `kv_cache_dtype: bf16`.
 - **122B EP=2** + **MiniMax M2.7 EP=2** carry matching `--speculative` / `--mtp-quantization` flags on both ranks (mismatched flags land MTP verify in the worker's SSM layer with no buffers allocated).
+- **Holo-3.1** (256K recipes) mandate `kv_cache_dtype: bf16` (1.4-2x faster prefill than fp8 *and* coherent at depth — fp8/nvfp4 KV degrade long-context) plus `ATLAS_KV_OVERCOMMIT=1` on the container (a 256K sequence needs ~16000 KV blocks; without overcommit the server refuses to start unless the pool can reserve `max_batch_size × 256K`). Holo-3.1-9B is dense `qwen3_5` and is served by the **`ornith-1.0-9b`** kernel target — there is no `holo-3.1-9b` kernel dir. Build the serve-anything artifact with `ATLAS_TARGET_MODEL='*'` (single-target builds are missing kernels) and `--no-default-features --features cuda` (drop the default `nccl` feature on a single GB10). Live-validated gx10/sm_121 2026-07-11.
 - **MiniMax M2.7 EP=2** is capped at `max_model_len: 12288` to fit the head's KV budget at `gpu_memory_utilization: 0.90` on the public `avarok/atlas-gb10:latest` image (live-validated 2026-05-08).
 
 ## Related

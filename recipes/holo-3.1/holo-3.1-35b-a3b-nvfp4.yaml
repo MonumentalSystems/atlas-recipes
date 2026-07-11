@@ -1,0 +1,90 @@
+recipe_version: "2"
+model: Hcompany/Holo-3.1-35B-A3B-NVFP4
+runtime: atlas
+container: atlas-gb10:b12x-ready
+max_nodes: 1
+
+metadata:
+  description: |
+    Holo-3.1-35B-A3B (qwen3_5_moe architecture, H Company NVFP4 checkpoint)
+    — the PRIMARY Holo-3.1 recipe, tuned for best throughput/latency at a
+    256K context window on a single GB10 (sm_121). Live-validated
+    2026-07-11 on gx10 against a tip Atlas build in atlas-gb10:b12x-ready.
+
+    HEADLINE: 256K long-context serving. The two levers that make 256K both
+    fast AND coherent:
+      - bf16 KV cache (kv_cache_dtype: bf16). Measured 1.4-2x faster prefill
+        than fp8 KV, and it stays coherent deep into the context where
+        fp8/nvfp4 KV degrade. Do NOT use fp8/nvfp4 KV for the long-context
+        recipe — the memory saving is not worth the quality cliff at depth.
+      - ATLAS_KV_OVERCOMMIT=1 (env, REQUIRED at 256K). A 256K sequence needs
+        ~16000 KV blocks; without overcommit the server refuses to start
+        unless the KV pool can hold max_batch_size x 256K reserved.
+        Overcommit switches to on-demand paged allocation, so max_batch_size
+        8 boots while any single sequence can still grow to the full 256K.
+
+    KV pool sizing (gpu_memory_utilization lever, GB10 121 GB):
+      - 0.72 (this default) with ~27 GB of co-tenants leaves a ~19 GB KV
+        pool -> 62277 blocks -> ~996K total KV tokens (~3.9 concurrent 256K
+        sequences resident; overcommit pages in the rest on demand).
+      - On a DEDICATED box push to 0.80-0.85 for more concurrent
+        long-context sequences.
+
+    lm-head: leave default. The NVFP4 checkpoint ships lm_head pre-packed
+    NVFP4; passing --lm-head-dtype bf16 is IGNORED for this checkpoint (do
+    not set lm_head_dtype here).
+
+    ---- BUILD (serve-anything artifact) ----
+    Kernel target for this model: holo-3.1-35b-a3b. Build ALL targets so one
+    binary serves any Holo-3.1 combo (a single-target build carries only that
+    model's kernels and errors with "missing more kernels than expected"):
+      ATLAS_TARGET_HW=gb10 \
+      ATLAS_TARGET_QUANT=nvfp4 \
+      ATLAS_TARGET_MODEL='*' \
+      cargo build --release --no-default-features --features cuda
+    Single-GB10: DROP the nccl feature (it is default-on but multi-GPU EP/TP
+    only, and libnccl is not in the single-node link path) — hence
+    --no-default-features --features cuda. Binary: target/release/spark.
+    Container base atlas-gb10:b12x-ready (CUDA 13.2); the host-built spark
+    runs in it via a bind-mount of the repo at /atlas.
+
+    ---- RUN (canonical on this box) ----
+    docker run -d --name holo31-35b --gpus all \
+      -v <repo>:/atlas -v /tank:/tank:ro \
+      -e HF_HUB_CACHE=/tank/hf/hub -e ATLAS_KV_OVERCOMMIT=1 \
+      -p 8888:8888 atlas-gb10:b12x-ready \
+      /atlas/target/release/spark serve "Hcompany/Holo-3.1-35B-A3B-NVFP4" \
+        --max-seq-len 256000 --kv-cache-dtype bf16 \
+        --gpu-memory-utilization 0.72 \
+        --scheduling-policy slai --tbt-deadline-ms 100 \
+        --ssm-cache-slots 256 --bind 0.0.0.0 --port 8888
+
+    Model ceiling is 262144 (max_position_embeddings); 256000 is the
+    validated 256K window and leaves headroom.
+  maintainer: monumental
+  category: agent
+  model_params: 35B
+  model_dtype: nvfp4
+  quantization: nvfp4
+  kv_dtype: bf16
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  # 256K window (validated). Model ceiling is 262144; 256000 is the
+  # live-validated long-context window.
+  max_model_len: 256000
+  # bf16 KV: 1.4-2x faster prefill than fp8 AND coherent at 256K depth.
+  # Never fp8/nvfp4 KV for the long-context recipe.
+  kv_cache_dtype: bf16
+  # 0.72 = safe with ~27 GB co-tenants (~19 GB KV pool, ~996K KV tokens).
+  # Raise to 0.80-0.85 on a dedicated box for more concurrent 256K seqs.
+  gpu_memory_utilization: 0.72
+  scheduling_policy: slai
+  # Marconi SSM snapshot slots (qwen3_5_moe is hybrid SSM+Attn). 256 holds
+  # a full multi-turn session without warm-checkpoint LRU churn.
+  ssm_cache_slots: 256
+  enable_prefix_caching: true
+# ENV (required at 256K, no declarative slot in recipe_version 2 — set on the
+# container, see RUN block above): ATLAS_KV_OVERCOMMIT=1, HF_HUB_CACHE=/tank/hf/hub.
+# TBT target: --tbt-deadline-ms 100 pairs with scheduling_policy: slai.

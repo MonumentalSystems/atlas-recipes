@@ -1,0 +1,67 @@
+recipe_version: "2"
+model: Hcompany/Holo-3.1-9B
+runtime: atlas
+container: atlas-gb10:b12x-ready
+max_nodes: 1
+
+metadata:
+  description: |
+    Holo-3.1-9B (qwen3_5 DENSE architecture, hidden_size 4096) — the small
+    dense sibling of the Holo-3.1 family, tuned for 256K long-context
+    serving on a single GB10 (sm_121). Live-validated shape 2026-07-11 on
+    gx10 against a tip Atlas build in atlas-gb10:b12x-ready.
+
+    KERNEL TARGET: ornith-1.0-9b. There is NO holo-3.1-9b kernel directory;
+    Holo-3.1-9B is a dense qwen3_5 (hidden_size 4096) and is served by the
+    ornith-1.0-9b dense kernel target. The upstream checkpoint is bf16
+    (unquantized) and loads through the nvfp4<->bf16 compat pair against the
+    all-targets NVFP4 build (see BUILD).
+
+    256K: Holo-3.1-9B's config reports max_position_embeddings 262144, so
+    the full 256K window fits with room to spare — max_seq_len 256000 needs
+    NO cap for this model. bf16 KV is used for the same reason as the 35B:
+    faster prefill and coherent at depth (fp8/nvfp4 KV degrade long-context).
+    ATLAS_KV_OVERCOMMIT=1 is still REQUIRED at 256K (on-demand paged KV
+    allocation). Being dense, there are no SSM-snapshot slots to tune.
+
+    ---- BUILD (shared serve-anything artifact) ----
+    Same '*' all-targets build as the 35B recipe (one binary serves any
+    Holo-3.1 combo). Kernel target for this model: ornith-1.0-9b.
+      ATLAS_TARGET_HW=gb10 ATLAS_TARGET_QUANT=nvfp4 ATLAS_TARGET_MODEL='*' \
+      cargo build --release --no-default-features --features cuda
+    Single-GB10: drop the (default-on) nccl feature — multi-GPU only, not in
+    the single-node link path. Binary: target/release/spark.
+
+    ---- RUN ----
+    docker run -d --name holo31-9b --gpus all \
+      -v <repo>:/atlas -v /tank:/tank:ro \
+      -e HF_HUB_CACHE=/tank/hf/hub -e ATLAS_KV_OVERCOMMIT=1 \
+      -p 8888:8888 atlas-gb10:b12x-ready \
+      /atlas/target/release/spark serve "Hcompany/Holo-3.1-9B" \
+        --max-seq-len 256000 --kv-cache-dtype bf16 \
+        --gpu-memory-utilization 0.72 \
+        --scheduling-policy slai --tbt-deadline-ms 100 \
+        --bind 0.0.0.0 --port 8888
+  maintainer: monumental
+  category: agent
+  model_params: 9B
+  model_dtype: bf16
+  quantization: none
+  kv_dtype: bf16
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  # 256K window. Holo-3.1-9B config max_position_embeddings=262144, so no
+  # cap is needed — 256000 is within the model's real limit.
+  max_model_len: 256000
+  kv_cache_dtype: bf16
+  # Dense 9B leaves plenty of headroom next to a 256K bf16 KV pool; 0.72 is
+  # a safe co-tenant default, raise on a dedicated box.
+  gpu_memory_utilization: 0.72
+  scheduling_policy: slai
+  enable_prefix_caching: true
+# ENV (required at 256K, set on the container — see RUN block):
+# ATLAS_KV_OVERCOMMIT=1, HF_HUB_CACHE=/tank/hf/hub.
+# TBT target: --tbt-deadline-ms 100 pairs with scheduling_policy: slai.
+# Dense model: no ssm_cache_slots (no SSM snapshot considerations).
