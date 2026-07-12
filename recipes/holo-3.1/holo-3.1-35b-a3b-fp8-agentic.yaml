@@ -53,9 +53,16 @@ metadata:
                           Did NOT hurt the harness: prefill is WARM there
                           (prefix cache + Marconi SSM checkpoints reuse the
                           ~16K opencode context), so wall-time is decode+loop
-                          bound, not prefill bound. For fast prefill on a
-                          dedicated box, raise --max-prefill-tokens 16384 +
-                          ATLAS_MAX_BATCH_TOKENS=16384 (~+2 GB, recovers ~4-5K)
+                          bound, not prefill bound. NOTE: the ~4-5K prefill
+                          quoted for NVFP4 is NOT reachable by this FP8
+                          checkpoint — A/B on the IDENTICAL stack (same 8K
+                          chunk): NVFP4 5547/5637/4704 vs FP8 1150/1220/1780
+                          (2K/4K/8K). The block-scaled FP8 MoE prefill is
+                          ~3-5x slower than NVFP4-grouped; raising the chunk
+                          helps FP8 only marginally, never to NVFP4 levels.
+                          For prefill-heavy work use the NVFP4 checkpoint
+                          (also faster decode, 76 vs 70). FP8's edge is the
+                          per-row fp8-head agentic FIDELITY (10/10), not speed.
       resident memory     ~84 GB (memory-tuned; stable, no crash)
     Comparison on the SAME harness:
       vLLM Holo (DFlash)          7/10 / 7/10  (mean 73 s — faster, spec decode)
