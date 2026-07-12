@@ -1,0 +1,154 @@
+recipe_version: "2"
+model: Hcompany/Holo-3.1-35B-A3B-FP8
+runtime: atlas
+container: atlas-gb10:b12x-ready
+max_nodes: 1
+
+metadata:
+  description: |
+    Holo-3.1-35B-A3B-FP8 — AGENTIC-OPTIMIZED config with the per-row FP8
+    lm-head. On a single GB10 (sm_121) this scored a PERFECT 10/10 on the
+    opencode webserver_ok + followed_directions agentic harness (see
+    RESULT), beating the NVFP4-head, bf16-head, and vLLM+DFlash baselines on
+    task-completion. Validated 2026-07-12 on dgx-00.
+
+    Two things make this config win, and BOTH are mandatory:
+
+    1. --lm-head-dtype fp8  (REQUIRES Atlas main >= #301)
+       The FP8 head is quantized with PER-ROW scales (one absmax-derived
+       scale per vocab row — automatic "calibration", not a single global
+       scale). PR #301 (fix(weights): FP8 lm_head + per-row scales) fixed a
+       head-path bug: the pre-#301 FP8 head scored only 4/10
+       followed_directions (dropped steps on long agentic runs); with #301
+       it is 10/10. So an Atlas build WITHOUT #301 must NOT use this head —
+       use --lm-head-dtype bf16 there instead. Holo-3.1-FP8's lm_head ships
+       BF16 (in the quant ignore list), so it CAN be runtime-quantized to
+       FP8 (the NVFP4 checkpoint's packed head CANNOT — the fp8 override is
+       silently ignored there).
+
+    2. NO ATLAS_FP8_SINGLE_SCALE, and ATLAS_LOOP_NO_SUPPRESS=1
+       - ATLAS_FP8_SINGLE_SCALE=1 DISABLES block-scaled prefill on this
+         block-scaled FP8 checkpoint → ~14x drift → agentic write-path
+         drift → failures. It must be ABSENT (see holo-3.1-35b-a3b-fp8.yaml
+         for the full explanation).
+       - ATLAS_LOOP_NO_SUPPRESS=1 stops the tool-call loop-detector from
+         hard-masking <tool_call> after ~3 similar turns; without it the
+         agent's legit cargo build/test/run iteration gets its next tool
+         call blocked mid-loop → content fast-fail. vLLM applies no such
+         mask; this flag matches that behavior.
+
+    ==================================================================
+    RESULT (2026-07-12, GB10, opencode agentic harness N=10)
+    ==================================================================
+      webserver_ok        10/10
+      followed_directions 10/10
+      mean wall           199 s   (Sum 1993 s)
+      decode              ~70 tok/s (w8a16 fp8 head)
+      prefill (COLD)      ~1150 (2K) / 1220 (4K) / 1780 (8K) tok/s
+                          — LOWER than the NVFP4 fast configs (~4-5K)
+                          because this is memory-tuned: --max-prefill-tokens
+                          8192 (vs 16384) + no ATLAS_MAX_BATCH_TOKENS halves
+                          the prefill chunk for crash-safety; block-scaled
+                          FP8 MoE prefill is also slower than NVFP4-grouped.
+                          Did NOT hurt the harness: prefill is WARM there
+                          (prefix cache + Marconi SSM checkpoints reuse the
+                          ~16K opencode context), so wall-time is decode+loop
+                          bound, not prefill bound. For fast prefill on a
+                          dedicated box, raise --max-prefill-tokens 16384 +
+                          ATLAS_MAX_BATCH_TOKENS=16384 (~+2 GB, recovers ~4-5K)
+      resident memory     ~84 GB (memory-tuned; stable, no crash)
+    Comparison on the SAME harness:
+      vLLM Holo (DFlash)          7/10 / 7/10  (mean 73 s — faster, spec decode)
+      Atlas NVFP4-head no-suppress 6/8 / 6/8
+      Atlas bf16-head             6/10 / 6/10
+      Atlas fp8-head (pre-#301)   6/10 / 4/10  (the bug #301 fixes)
+      Atlas fp8-head (#301) THIS  10/10 / 10/10
+    So Atlas LEADS on task completion; vLLM leads on wall-time (DFlash).
+
+    ==================================================================
+    MEMORY TUNING (why the small params) — keeps it ~84 GB, crash-safe
+    ==================================================================
+    dgx-00 hard-crashes under peak GPU load; a 256K x batch-16 KV config
+    spikes buffers and trips it. This config trims to the harness's real
+    need (~16K context, low concurrency):
+      --ssm-cache-slots 32     (vs 128 → reclaims ~6 GB; 128 is for deep
+                                100+-turn convos, not single-turn coding)
+      --max-num-seqs 4 --max-batch-size 4  (decode-rollback ring 4→2 GB,
+                                smaller inference reserve)
+      --max-prefill-tokens 8192            (buffer arena 3.9→2.0 GB)
+      --gpu-memory-utilization 0.45        (KV pool ~7 GB / 379K tokens)
+    NOTE: main lacks --target-kv-tokens (it lives on feat/b12x-moe + the
+    image binary); use --gpu-memory-utilization here. On a build that HAS
+    it, `--target-kv-tokens 256000` gives an even tighter ~4.9 GB KV pool.
+
+    ==================================================================
+    BUILD — INSIDE atlas-gb10:b12x-ready, target holo-3.1-35b-a3b,
+    Atlas main >= #301
+    ==================================================================
+      docker run --rm -v <repo>:/atlas -w /atlas atlas-gb10:b12x-ready \
+        bash -c 'ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=holo-3.1-35b-a3b \
+          ATLAS_TARGET_QUANT=nvfp4 \
+          cargo build --release -p spark-server \
+            --no-default-features --features cuda'
+
+    ==================================================================
+    RUN
+    ==================================================================
+    docker run -d --name holo-fp8-agentic --gpus all --ipc=host \
+      -v <repo>:/atlas -v /tank:/tank:ro -e HF_HUB_CACHE=/tank/hf/hub \
+      -e ATLAS_TARGET_HW=gb10 -e HF_HUB_OFFLINE=1 -e RUST_LOG=info \
+      -e ATLAS_LOOP_NO_SUPPRESS=1 \
+      -e ATLAS_HOLO_LOW_MEMORY_MOE=1 -e ATLAS_HOLO_FAST_MOE_MODE=full \
+      -e ATLAS_HOLO_FAST_MOE_LAYERS=0-39 \
+      -e ATLAS_HOLO_MOE_GROUPED_CUTLASS=1 -e ATLAS_HOLO_MOE_GROUPED_DOWN=1 \
+      -e ATLAS_MOE_PREFILL_EXACT_TILES=1 \
+      -e ATLAS_HOLO_NATIVE_FP8_ATTN=1 -e ATLAS_HOLO_NATIVE_FP8_SSM=1 \
+      -e ATLAS_HOLO_FP4_PROJ_DECODE=1 \
+      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=1 \
+      -e ATLAS_FLASHINFER_PREFILL=1 -e ATLAS_CUBLAS_GEMM=1 \
+      -e ATLAS_CUTLASS_WORKSPACE_MB=512 -e ATLAS_KV_OVERCOMMIT=1 \
+      -e ATLAS_SSM_BATCHED_RECURRENT=1 \
+      -e ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so \
+      -e CUTE_DSL_ARCH=sm_121a \
+      -e ATLAS_PREFILL_VARLEN=1 -e ATLAS_PREFILL_CODISPATCH=1 \
+      -e ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100 \
+      -e ATLAS_Q12_BATCHED=1 -e ATLAS_Q12_BATCHED_FIRST_CHUNK=1 \
+      -e ATLAS_DECODE_GRAPHS_MULTISEQ=1 \
+      -p 8888:8888 atlas-gb10:b12x-ready \
+      /atlas/target/release/spark serve "Hcompany/Holo-3.1-35B-A3B-FP8" \
+        --port 8888 --bind 0.0.0.0 \
+        --kv-cache-dtype bf16 --lm-head-dtype fp8 \
+        --gpu-memory-utilization 0.45 \
+        --max-seq-len 131072 --max-num-seqs 4 --max-batch-size 4 \
+        --max-prefill-tokens 8192 --scheduling-policy slai \
+        --enable-prefix-caching true \
+        --ssm-cache-slots 32 --ssm-checkpoint-interval 16
+
+    # ATLAS_FP8_SINGLE_SCALE is DELIBERATELY ABSENT (block-scaled footgun).
+    # ATLAS_HOLO_MOE_B12X unset (not needed; SSM-masked at agentic context).
+    # No --speculative (Holo ships no MTP head).
+  maintainer: monumental
+  category: agent
+  model_params: 35B
+  model_dtype: fp8
+  quantization: compressed-tensors-fp8-block
+  kv_dtype: bf16
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 131072
+  kv_cache_dtype: bf16
+  lm_head_dtype: fp8
+  gpu_memory_utilization: 0.45
+  max_num_seqs: 4
+  max_batch_size: 4
+  max_prefill_tokens: 8192
+  scheduling_policy: slai
+  ssm_cache_slots: 32
+  ssm_checkpoint_interval: 16
+  enable_prefix_caching: true
+# ENV: mandatory correctness/agentic flags — ATLAS_LOOP_NO_SUPPRESS=1,
+# ATLAS_FP8_SINGLE_SCALE ABSENT, --lm-head-dtype fp8 on an Atlas build >= #301
+# (per-row FP8 head). Full ATLAS_* Holo fast stack required (see RUN).
+# Validated 10/10 webserver_ok + followed_directions, 2026-07-12 GB10.
