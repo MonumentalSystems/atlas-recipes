@@ -1,0 +1,157 @@
+recipe_version: "2"
+model: AEON-7/Ornith-1.0-35B-AEON-Ultimate-Uncensored-NVFP4
+runtime: atlas
+container: atlas-gb10:b12x-ready
+max_nodes: 1
+
+metadata:
+  description: |
+    Ornith-1.0-35B (AEON-7 NVFP4 repack: "AEON-Ultimate-Uncensored-NVFP4")
+    on a single GB10 (sm_121). This is the RECOMMENDED Ornith recipe —
+    native NVFP4 runs at full speed on Atlas's fast path, unlike the
+    deepreinforce-ai FP8 checkpoint (per-channel FP8 → must BF16-dequant,
+    ~2x slower decode; see ornith-1.0-35b-fp8.yaml). Prefer THIS one.
+
+    Live-validated 2026-07-11 on gx10 against a tip Atlas build (main #298)
+    in the CUDA-13.2 CUTLASS/FlashInfer container atlas-gb10:b12x-ready.
+
+    Checkpoint: compressed-tensors, format "nvfp4-pack-quantized" (uniform
+    NVFP4 — packed E2M1 + block scales), qwen3_5_moe arch + vision, NO mtp
+    head. Atlas resolves it to the qwen3_6_moe path → kernel target
+    qwen3.6-35b-a3b (NOT holo-3.1-35b-a3b — the qwen3_5_moe→holo3_1_moe
+    rewrite does not fire for this checkpoint). quant compat is a NATIVE
+    match: kernel=nvfp4 model=nvfp4 (no dequant, no compat workaround).
+
+    ======================================================================
+    MEASURED (2026-07-11, gx10, this config)
+    ======================================================================
+      coherence: PASS ("17 + 26 = 43", finish=stop)
+      decode:    ~88-89 tok/s   (2.2x the FP8 per-channel BF16-dequant path)
+      prefill:   ~4300 tok/s warm (803 tok, TTFT 186 ms); the full fast
+                 prefill-accelerator stack applies exactly as for Holo-3.1.
+      NVFP4 weights are ~half the BF16-dequant footprint → far more KV /
+      concurrency headroom than the FP8 recipe (which resides ~72 GB BF16).
+
+    ======================================================================
+    BUILD — INSIDE atlas-gb10:b12x-ready, kernel target qwen3.6-35b-a3b
+    ======================================================================
+    Build in the container so build.rs sees CUTLASS_HOME (a bare-host build
+    silently omits the fused-MoE kernel and prefill collapses to ~500 tok/s):
+
+      docker run --rm -v <repo>:/atlas -w /atlas atlas-gb10:b12x-ready \
+        bash -c 'ATLAS_TARGET_HW=gb10 \
+          ATLAS_TARGET_MODEL=qwen3.6-35b-a3b \
+          ATLAS_TARGET_QUANT=nvfp4 \
+          cargo build --release -p spark-server \
+            --no-default-features --features cuda'
+    Binary: target/release/spark. NOTE: the image's BAKED binary
+    (/build/target/release/spark) only carries the holo-3.1-35b-a3b target
+    and will reject this model ("No compiled kernel target matches
+    qwen3_6_moe") — you MUST build the qwen3.6-35b-a3b target (or '*').
+
+    ======================================================================
+    FULL PROVEN ENV — identical to the Holo-3.1 NVFP4 fast stack. Keep the
+    image's baked ATLAS_CUTLASS_NVFP4_GEMM=1 (CORRECT for NVFP4 weights).
+    Be explicit; dropping any prefill flag silently HALVES prefill.
+    ======================================================================
+      ATLAS_TARGET_HW=gb10   HF_HUB_OFFLINE=1   RUST_LOG=info
+
+      # --- MoE / attn / SSM (qwen3_6_moe; NVFP4 native) ---
+      ATLAS_HOLO_LOW_MEMORY_MOE=1
+      ATLAS_HOLO_FAST_MOE_MODE=full
+      ATLAS_HOLO_FAST_MOE_LAYERS=0-39
+      ATLAS_HOLO_MOE_GROUPED_CUTLASS=1
+      ATLAS_HOLO_MOE_GROUPED_DOWN=1
+      ATLAS_MOE_PREFILL_EXACT_TILES=1
+      ATLAS_HOLO_NATIVE_FP8_ATTN=1
+      ATLAS_HOLO_NATIVE_FP8_SSM=1
+      ATLAS_HOLO_FP4_PROJ_DECODE=1
+
+      # --- GDN/SSM + GEMM ---
+      ATLAS_GDN_TC_VBLOCK=0
+      ATLAS_GDN_FLASHINFER=1   # short-context default (faster); drop to =0
+                               # at >=128K if long-ctx drift appears (the
+                               # Holo FlashInfer-GDN 200K corruption; not yet
+                               # characterized on Ornith at depth).
+      ATLAS_FLASHINFER_PREFILL=1
+      ATLAS_CUBLAS_GEMM=1
+      ATLAS_CUTLASS_WORKSPACE_MB=512
+      ATLAS_KV_OVERCOMMIT=1
+      ATLAS_SSM_BATCHED_RECURRENT=1
+      ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so
+      CUTE_DSL_ARCH=sm_121a
+
+      # --- Prefill accelerators (model-agnostic) ---
+      ATLAS_PREFILL_VARLEN=1
+      ATLAS_PREFILL_CODISPATCH=1
+      ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100
+      ATLAS_Q12_BATCHED=1
+      ATLAS_Q12_BATCHED_FIRST_CHUNK=1
+      ATLAS_MAX_BATCH_TOKENS=16384
+      ATLAS_DECODE_GRAPHS_MULTISEQ=1
+      ATLAS_FP8_SINGLE_SCALE=1
+
+    ======================================================================
+    RUN — canonical on this box
+    ======================================================================
+    docker run -d --name ornithnv --gpus all --ipc=host \
+      -v <repo>:/atlas -v /tank:/tank:ro \
+      -e HF_HUB_CACHE=/tank/hf/hub \
+      -e ATLAS_TARGET_HW=gb10 -e HF_HUB_OFFLINE=1 -e RUST_LOG=info \
+      -e ATLAS_HOLO_LOW_MEMORY_MOE=1 -e ATLAS_HOLO_FAST_MOE_MODE=full \
+      -e ATLAS_HOLO_FAST_MOE_LAYERS=0-39 \
+      -e ATLAS_HOLO_MOE_GROUPED_CUTLASS=1 -e ATLAS_HOLO_MOE_GROUPED_DOWN=1 \
+      -e ATLAS_MOE_PREFILL_EXACT_TILES=1 \
+      -e ATLAS_HOLO_NATIVE_FP8_ATTN=1 -e ATLAS_HOLO_NATIVE_FP8_SSM=1 \
+      -e ATLAS_HOLO_FP4_PROJ_DECODE=1 \
+      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=1 \
+      -e ATLAS_FLASHINFER_PREFILL=1 -e ATLAS_CUBLAS_GEMM=1 \
+      -e ATLAS_CUTLASS_WORKSPACE_MB=512 -e ATLAS_KV_OVERCOMMIT=1 \
+      -e ATLAS_SSM_BATCHED_RECURRENT=1 \
+      -e ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so \
+      -e CUTE_DSL_ARCH=sm_121a \
+      -e ATLAS_PREFILL_VARLEN=1 -e ATLAS_PREFILL_CODISPATCH=1 \
+      -e ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100 \
+      -e ATLAS_Q12_BATCHED=1 -e ATLAS_Q12_BATCHED_FIRST_CHUNK=1 \
+      -e ATLAS_MAX_BATCH_TOKENS=16384 -e ATLAS_DECODE_GRAPHS_MULTISEQ=1 \
+      -e ATLAS_FP8_SINGLE_SCALE=1 \
+      -p 8888:8888 atlas-gb10:b12x-ready \
+      /atlas/target/release/spark serve \
+        "AEON-7/Ornith-1.0-35B-AEON-Ultimate-Uncensored-NVFP4" \
+        --port 8888 --bind 0.0.0.0 \
+        --kv-cache-dtype bf16 --gpu-memory-utilization 0.7 \
+        --max-seq-len 262144 --max-num-seqs 16 --max-batch-size 16 \
+        --max-prefill-tokens 16384 --scheduling-policy slai \
+        --enable-prefix-caching true \
+        --ssm-cache-slots 128 --ssm-checkpoint-interval 16
+
+    lm-head: leave default (do NOT pass --lm-head-dtype). The NVFP4 pack
+    ships lm_head handling per its ignore list; passing a head dtype can
+    wrongly imply an unpacked head. Speculative: none (no mtp head in this
+    repack). This is a vision checkpoint (image_token present) — text-only
+    serving is unaffected.
+  maintainer: monumental
+  category: agent
+  model_params: 35B
+  model_dtype: nvfp4
+  quantization: nvfp4
+  kv_dtype: bf16
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  max_model_len: 262144
+  kv_cache_dtype: bf16
+  gpu_memory_utilization: 0.7
+  max_num_seqs: 16
+  max_batch_size: 16
+  max_prefill_tokens: 16384
+  scheduling_policy: slai
+  ssm_cache_slots: 128
+  ssm_checkpoint_interval: 16
+  enable_prefix_caching: true
+# ENV: the FULL ATLAS_* prefill stack is MANDATORY (no declarative slot in
+# recipe_version 2) — set every -e (see BUILD/RUN). Build the
+# qwen3.6-35b-a3b target INSIDE atlas-gb10:b12x-ready; the image's baked
+# holo-only binary rejects this model. NVFP4 is native (kernel=nvfp4
+# model=nvfp4) — NO FP8-dequant flags, unlike the FP8 sibling recipe.
