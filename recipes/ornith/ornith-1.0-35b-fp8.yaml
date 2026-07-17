@@ -1,0 +1,186 @@
+recipe_version: "2"
+model: deepreinforce-ai/Ornith-1.0-35B-FP8
+runtime: atlas
+container: atlas-gb10:b12x-ready
+max_nodes: 1
+
+metadata:
+  description: |
+    Ornith-1.0-35B-FP8 (deepreinforce-ai; a Qwen3.6-35B-A3B fine-tune,
+    qwen3_5_moe arch + vision + mtp_num_hidden_layers=1) on a single GB10
+    (sm_121). Live-validated 2026-07-11 on gx10 against a tip Atlas build in
+    the CUDA-13.2 CUTLASS/FlashInfer container atlas-gb10:b12x-ready.
+
+    ======================================================================
+    CRITICAL — this checkpoint is PER-CHANNEL FP8; it needs BF16 dequant
+    ======================================================================
+    Ornith is quantized with compressed-tensors `float-quantized`,
+    weights `strategy: "channel"` → a 1-D PER-OUTPUT-CHANNEL scale
+    (weight_scale shape [N,1], e.g. gate_proj [512,2048] fp8 + [512,1] bf16).
+    This is DIFFERENT from Qwen's native fp8 (per-tensor) and from Holo-3.1's
+    compressed-tensors BLOCK scale ([N/128,K/128]).
+
+    Atlas's native-FP8 fast path assumes a 128-wide block scale and indexes
+    [N,1] per-channel scales as a [N/128,K/128] grid — reading only 64 of 512
+    scales in the wrong layout → DEGENERATE OUTPUT (reasoning collapses to
+    repeated "1111..."). This is NOT a flag/binary bug: base
+    Qwen/Qwen3.6-35B-A3B-FP8 (per-tensor scales) is fully coherent on the
+    exact same binary/kernels.
+
+    THE FIX (no code change): dequant every weight to BF16 at load. Both
+    ATLAS_FP8_DEQUANT_MOE_TO_BF16=1 and ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1
+    (all layers, do NOT set ATLAS_FP8_DEQUANT_LAYERS) route weights through
+    `dequant_fp8_blockscaled_to_bf16`, which derives block_n=n/sn and
+    block_k=k/sk from the ACTUAL scale shape — so [512,1] gives block_n=1,
+    block_k=K = correct per-channel dequant. With BOTH flags on, Ornith is
+    COHERENT ("17 + 26 = 43", finish=stop). MoE experts AND attention must
+    BOTH dequant — dequanting only one (or only some layers) stays garbage.
+
+    A native per-channel FP8 GEMM (W16A16 → W8A16 per-row) is the SPEED
+    follow-up (upstream to Avarok/main); until then this recipe runs W16A16
+    (BF16), which is correct but ~1.6x slower decode than native FP8.
+
+    ======================================================================
+    MEASURED (2026-07-11, gx10, this config)
+    ======================================================================
+      coherence: PASS (greedy + temp 0.6; reasoning + final answer correct)
+      decode:    ~40-42 tok/s  (BF16-dequant bandwidth-bound; native fp8
+                                would be ~67, but native fp8 is INCOHERENT
+                                here — correctness wins)
+      prefill:   ~645 tok/s cold at 731 tok (TTFT 1134 ms)
+      warm TTFT: ~33 ms (prefix cache hit)
+      memory:    BF16-dequant model ~72 GB resident (~2x the fp8 weights);
+                 at gpu_memory_utilization 0.9 leaves ~27 GB KV = ~1.42M
+                 bf16 KV tokens paged. 256K single sequences fit via
+                 ATLAS_KV_OVERCOMMIT=1; high concurrency does NOT (the 72 GB
+                 model leaves little room) — keep max_num_seqs modest.
+
+    ======================================================================
+    BUILD — INSIDE atlas-gb10:b12x-ready, kernel target qwen3.6-35b-a3b
+    ======================================================================
+    Ornith declares mtp_num_hidden_layers=1, so the config dispatch keeps it
+    on the qwen3_6_moe path (it does NOT rewrite to holo3_1_moe the way the
+    vision+mtp=0 Holo checkpoint does). The kernel target is therefore
+    qwen3.6-35b-a3b (nvfp4 kernel bundle; quant compat kernel=nvfp4
+    model=fp8 is fine because we DEQUANT to BF16 at load). Build in the
+    container so build.rs sees CUTLASS_HOME (bare-host build silently omits
+    the fused-MoE kernel):
+
+      docker run --rm -v <repo>:/atlas -w /atlas atlas-gb10:b12x-ready \
+        bash -c 'ATLAS_TARGET_HW=gb10 \
+          ATLAS_TARGET_MODEL=qwen3.6-35b-a3b \
+          ATLAS_TARGET_QUANT=nvfp4 \
+          cargo build --release -p spark-server \
+            --no-default-features --features cuda'
+    Binary: target/release/spark.
+
+    ======================================================================
+    FULL PROVEN ENV — be EXPLICIT with every flag: the image BAKES
+    ATLAS_CUTLASS_NVFP4_GEMM=1 / ATLAS_TARGET_QUANT=nvfp4 /
+    ATLAS_TARGET_MODEL=holo-3.1-35b-a3b, which we must override.
+    ======================================================================
+      ATLAS_TARGET_HW=gb10   HF_HUB_OFFLINE=1   RUST_LOG=info
+
+      # --- THE correctness core (per-channel FP8 → BF16 dequant) ---
+      ATLAS_FP8_DEQUANT_MOE_TO_BF16=1    # all MoE experts + shared → BF16
+      ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1   # attention Q/K/V/O → BF16 (TP=1)
+      # do NOT set ATLAS_FP8_DEQUANT_LAYERS — every layer must dequant
+      ATLAS_CUTLASS_NVFP4_GEMM=0         # override the image's baked =1
+                                         # (nvfp4 GEMM on fp8 weights = garbage)
+      # do NOT set the ATLAS_HOLO_* fast-MoE / NATIVE_FP8_* flags — those are
+      # the native-FP8/NVFP4 MoE path; the MoE here runs BF16 grouped GEMM.
+
+      # --- GDN/SSM + prefill accelerators (model-agnostic; coherence-gated
+      #     PASS on Ornith 2026-07-11) ---
+      ATLAS_GDN_TC_VBLOCK=0
+      ATLAS_GDN_FLASHINFER=1   # short-context default (user pref). See the
+                               # long-context note: drop to =0 at >=128K if
+                               # Ornith shows the same FlashInfer-GDN drift
+                               # Holo did (untested on Ornith at depth).
+      ATLAS_FLASHINFER_PREFILL=1
+      ATLAS_CUBLAS_GEMM=1
+      ATLAS_CUTLASS_WORKSPACE_MB=512
+      ATLAS_KV_OVERCOMMIT=1
+      ATLAS_SSM_BATCHED_RECURRENT=1
+      ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so
+      CUTE_DSL_ARCH=sm_121a
+      ATLAS_PREFILL_VARLEN=1
+      ATLAS_PREFILL_CODISPATCH=1
+      ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100
+      ATLAS_Q12_BATCHED=1
+      ATLAS_Q12_BATCHED_FIRST_CHUNK=1
+      ATLAS_MAX_BATCH_TOKENS=16384
+      ATLAS_DECODE_GRAPHS_MULTISEQ=1
+
+    ======================================================================
+    RUN — canonical on this box
+    ======================================================================
+    docker run -d --name ornith35b --gpus all --ipc=host \
+      -v <repo>:/atlas -v /tank:/tank:ro \
+      -e HF_HUB_CACHE=/tank/hf/hub \
+      -e ATLAS_TARGET_HW=gb10 -e HF_HUB_OFFLINE=1 -e RUST_LOG=info \
+      -e ATLAS_CUTLASS_NVFP4_GEMM=0 \
+      -e ATLAS_FP8_DEQUANT_MOE_TO_BF16=1 -e ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1 \
+      -e ATLAS_GDN_TC_VBLOCK=0 -e ATLAS_GDN_FLASHINFER=1 \
+      -e ATLAS_FLASHINFER_PREFILL=1 -e ATLAS_CUBLAS_GEMM=1 \
+      -e ATLAS_CUTLASS_WORKSPACE_MB=512 -e ATLAS_KV_OVERCOMMIT=1 \
+      -e ATLAS_SSM_BATCHED_RECURRENT=1 \
+      -e ATLAS_GDN_LIB=/atlas/3rdparty_patches/gdn_aot/libatlasgdn.so \
+      -e CUTE_DSL_ARCH=sm_121a \
+      -e ATLAS_PREFILL_VARLEN=1 -e ATLAS_PREFILL_CODISPATCH=1 \
+      -e ATLAS_PREFILL_CODISPATCH_WINDOW_MS=100 \
+      -e ATLAS_Q12_BATCHED=1 -e ATLAS_Q12_BATCHED_FIRST_CHUNK=1 \
+      -e ATLAS_MAX_BATCH_TOKENS=16384 -e ATLAS_DECODE_GRAPHS_MULTISEQ=1 \
+      -p 8888:8888 atlas-gb10:b12x-ready \
+      /atlas/target/release/spark serve "deepreinforce-ai/Ornith-1.0-35B-FP8" \
+        --port 8888 --bind 0.0.0.0 \
+        --kv-cache-dtype bf16 --lm-head-dtype bf16 \
+        --kv-high-precision-layers auto \
+        --gpu-memory-utilization 0.9 \
+        --max-seq-len 262144 --max-num-seqs 4 --max-batch-size 4 \
+        --max-prefill-tokens 16384 --scheduling-policy slai \
+        --enable-prefix-caching true \
+        --ssm-cache-slots 128 --ssm-checkpoint-interval 16
+
+    lm-head: --lm-head-dtype bf16. Ornith's lm_head is in the checkpoint's
+    quant `ignore` list (unquantized) — keep it BF16; do NOT pass nvfp4.
+    Speculative: NOT enabled. Ornith declares mtp_num_hidden_layers=1 but
+    ships NO mtp weights (no mtp.safetensors) → --speculative disables
+    itself. The z-lab/Qwen3.6-35B-A3B-DFlash drafter is architecture-
+    compatible but drafter-checkpoint resolution needs a real HF-cache
+    layout (repo-id resolution failed on a read-only mount); revisit for
+    a DFlash speed pass.
+  maintainer: monumental
+  category: agent
+  model_params: 35B
+  model_dtype: fp8
+  quantization: compressed-tensors-fp8-per-channel
+  kv_dtype: bf16
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  # 256K window (max_position_embeddings) via ATLAS_KV_OVERCOMMIT=1 paged KV.
+  # Single 256K sequences fit; high concurrency does not (72 GB BF16 model).
+  max_model_len: 262144
+  # bf16 KV: faster prefill + coherent at depth. Never fp8/nvfp4 KV here.
+  kv_cache_dtype: bf16
+  # 0.9: the BF16-dequant model is ~72 GB; needs high util to leave KV room.
+  # Requires a dedicated box (free co-tenants first).
+  gpu_memory_utilization: 0.9
+  # Modest concurrency — the 72 GB resident model caps how many sequences fit.
+  max_num_seqs: 4
+  max_batch_size: 4
+  max_prefill_tokens: 16384
+  scheduling_policy: slai
+  # Marconi SSM snapshot slots (qwen3_6_moe is hybrid SSM+Attn, 30/40 GDN).
+  ssm_cache_slots: 128
+  ssm_checkpoint_interval: 16
+  enable_prefix_caching: true
+  # lm_head is unquantized in this checkpoint — keep BF16.
+  lm_head_dtype: bf16
+# ENV: the correctness core (ATLAS_FP8_DEQUANT_MOE_TO_BF16=1 +
+# ATLAS_FP8_DEQUANT_ATTN_TO_BF16=1 + ATLAS_CUTLASS_NVFP4_GEMM=0) is MANDATORY
+# — without it Ornith's per-channel FP8 outputs garbage. Be EXPLICIT with
+# every -e (the image bakes NVFP4/holo defaults). Build INSIDE
+# atlas-gb10:b12x-ready with ATLAS_TARGET_MODEL=qwen3.6-35b-a3b.
